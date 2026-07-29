@@ -3744,6 +3744,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
+        # Optional Review Panel dependency: default OFF, lazy singleton, no
+        # provider invocation or adapter/event registration during startup.
+        from gateway.review_panel_runtime import get_review_panel_runtime
+        self.review_panel_runtime = get_review_panel_runtime()
+        self.review_panel = self.review_panel_runtime.panel
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
