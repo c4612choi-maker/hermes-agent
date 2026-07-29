@@ -6,7 +6,9 @@ no network, no side effects. They verify the scaffold's safety properties.
 """
 
 import os
+import subprocess
 import sys
+import threading
 import time
 from unittest.mock import patch, MagicMock
 
@@ -14,15 +16,18 @@ import pytest
 
 
 class FakeProcess:
-    def __init__(self, stdout="PASS", stderr="", returncode=0, timeout=False, pid=4242):
+    def __init__(self, stdout="PASS", stderr="", returncode=0, timeout=False, pid=4242, wait_raises=False):
         self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
         self.timeout, self.pid = timeout, pid
         self.killed = False
         self.wait_calls = 0
         self.last_input = None
+        self.wait_raises = wait_raises
     def poll(self): return None if self.timeout and not self.killed else self.returncode
     def wait(self, timeout=None):
         self.wait_calls += 1
+        if self.wait_raises:
+            raise subprocess.TimeoutExpired("grok", timeout)
         return self.returncode
     def communicate(self, input=None, timeout=None):
         self.last_input = input
@@ -91,17 +96,41 @@ class TestGrokProvider:
         from gateway.review_panel import _mask_secrets
         assert secret not in _mask_secrets('value=' + secret)
 
+    @pytest.mark.parametrize("payload, secret", [
+        ('{"api_key": "json-secret"}', "json-secret"),
+        ('{"token":"json-token"}', "json-token"),
+        ("Authorization: Bearer bearer-secret", "bearer-secret"),
+        ("https://example.test/?token=url-token&key=url-key&ok=1", "url-token"),
+        ("https://example.test/?token=url-token&key=url-key&ok=1", "url-key"),
+    ])
+    def test_masking_json_authorization_and_query_values(self, payload, secret):
+        from gateway.review_panel import _mask_secrets
+        assert secret not in _mask_secrets(payload)
+
+    def test_masking_never_raises_for_unprintable_value(self):
+        from gateway.review_panel import _mask_secrets
+        class Unprintable:
+            def __str__(self):
+                raise RuntimeError("nope")
+        assert _mask_secrets(Unprintable()) == "***"
+
     def test_verdict_requires_explicit_single_field(self):
         p = GrokReviewProvider()
         assert p._parse_output('VERDICT: PASS', 0).verdict == Verdict.PASS
         assert p._parse_output('mentions BLOCKED only', 0).verdict == Verdict.BLOCKED
         assert p._parse_output('VERDICT: PASS\nVERDICT: REVISE', 0).verdict == Verdict.BLOCKED
+        assert p._parse_output('VERDICT: MAYBE', 0).verdict == Verdict.BLOCKED
     def test_grok_skipped_when_disabled(self):
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
         assert result.verdict == Verdict.SKIPPED
         assert "disabled" in result.summary.lower()
+
+    def test_prompt_requires_first_non_empty_verdict_contract(self):
+        prompt = ReviewPacket(task_id="t1", requirements="r", diff_or_artifacts="d").to_prompt()
+        assert "first non-empty line MUST be exactly one of" in prompt
+        assert "VERDICT: PASS" in prompt
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     def test_grok_cli_not_found(self):
@@ -124,6 +153,41 @@ class TestGrokProvider:
         assert "timed out" in result.summary.lower()
         assert process.killed
         assert process.wait_calls == 1
+
+    @pytest.mark.parametrize("taskkill_result", [1, subprocess.TimeoutExpired("taskkill", 5), RuntimeError("taskkill")])
+    @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
+    @patch("gateway.review_panel.subprocess.Popen")
+    @patch("gateway.review_panel.subprocess.run")
+    def test_grok_timeout_taskkill_failures_kill_and_reap(self, mock_taskkill, mock_popen, taskkill_result):
+        process = FakeProcess(timeout=True)
+        mock_popen.return_value = process
+        mock_taskkill.side_effect = taskkill_result if isinstance(taskkill_result, Exception) else None
+        if not isinstance(taskkill_result, Exception):
+            mock_taskkill.return_value = MagicMock(returncode=taskkill_result)
+        result = GrokReviewProvider(timeout_seconds=1).review(ReviewPacket("t", "r", "d"))
+        assert result.verdict == Verdict.DEGRADED_WITHOUT_GROK
+        assert process.killed
+        assert process.wait_calls >= 1
+
+    @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
+    @patch("gateway.review_panel.subprocess.Popen")
+    @patch("gateway.review_panel.subprocess.run", return_value=MagicMock(returncode=0))
+    def test_grok_timeout_taskkill_success_reaps_without_kill(self, mock_taskkill, mock_popen):
+        process = FakeProcess(timeout=True)
+        mock_popen.return_value = process
+        result = GrokReviewProvider(timeout_seconds=1).review(ReviewPacket("t", "r", "d"))
+        assert result.verdict == Verdict.DEGRADED_WITHOUT_GROK
+        assert not process.killed
+        assert process.wait_calls == 1
+
+    def test_already_exited_process_is_not_killed(self):
+        from gateway import review_panel
+        process = FakeProcess(returncode=0)
+        with patch.object(review_panel.os, "name", "nt"), patch("gateway.review_panel.subprocess.run") as taskkill:
+            review_panel._terminate_process_tree(process)
+        assert not process.killed
+        assert process.wait_calls == 0
+        taskkill.assert_not_called()
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.Popen")
@@ -155,6 +219,20 @@ class TestGrokProvider:
         env = call_args.kwargs.get("env", {})
         for key in env:
             assert not any(s in key.upper() for s in ("TOKEN", "SECRET", "KEY", "PASSWORD"))
+
+    @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_long_prompt_uses_stdin_and_isolated_cwd(self, mock_popen):
+        process = FakeProcess(stdout="VERDICT: PASS")
+        mock_popen.return_value = process
+        prompt_text = "x" * 20000
+        GrokReviewProvider().review(ReviewPacket("t", prompt_text, "d"))
+        args, kwargs = mock_popen.call_args
+        assert args[0] == ["grok", "-p", "-"]
+        assert prompt_text not in args[0]
+        assert kwargs["stdin"] is subprocess.PIPE
+        assert kwargs["cwd"]
+        assert process.last_input and len(process.last_input) > len(args[0])
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.Popen")
@@ -271,7 +349,29 @@ class TestBotApprovalInvalid:
         process = FakeProcess(timeout=True, pid=9876)
         with patch.object(review_panel.os, 'name', 'nt'), patch('gateway.review_panel.subprocess.run') as taskkill:
             review_panel._terminate_process_tree(process)
-        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5, check=True)
+        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5, check=False)
+
+
+class TestReviewResultSanitization:
+    def test_panel_sanitizes_provider_result_and_to_dict(self):
+        class LeakyProvider:
+            name = "leaky"
+            def review(self, packet):
+                return ReviewResult(
+                    provider=self.name, verdict=Verdict.PASS,
+                    summary='{"token":"summary-secret"}', error="Authorization: Bearer error-secret",
+                    raw_output="ghp_rawsecret", blockers=["sk-blockersecret"],
+                    risks=["xoxb-risksecret"], questions=["?token=query-secret"],
+                )
+        with patch.dict(os.environ, {"HERMES_REVIEW_PANEL": "1"}):
+            result = ReviewPanel([LeakyProvider()]).submit_for_review(ReviewPacket("t", "r", "d"))[0]
+        rendered = result.to_dict()
+        assert "summary-secret" not in str(rendered)
+        assert "error-secret" not in str(rendered)
+        assert "rawsecret" not in str(rendered)
+        assert "blockersecret" not in str(rendered)
+        assert "risksecret" not in str(rendered)
+        assert "query-secret" not in str(rendered)
 
 
 # ── Event ID replay ────────────────────────────────────────────────────────
@@ -290,6 +390,26 @@ class TestEventDedup:
         assert not panel.is_event_duplicate("e2")
         assert panel.is_event_duplicate("e1")
 
+    def test_dedup_thread_safe_and_evicts_oldest_event(self):
+        panel = ReviewPanel()
+        panel._event_limit = 2
+        results = []
+        lock = threading.Lock()
+        def record():
+            duplicate = panel.is_event_duplicate("same")
+            with lock:
+                results.append(duplicate)
+        threads = [threading.Thread(target=record) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert results.count(False) == 1
+        assert results.count(True) == 7
+        assert not panel.is_event_duplicate("old")
+        assert not panel.is_event_duplicate("new")
+        assert not panel.is_event_duplicate("same")
+
 
 # ── Task single-flight ─────────────────────────────────────────────────────
 
@@ -301,6 +421,54 @@ class TestSingleFlight:
             assert panel.submit_for_review(packet)[0].verdict == Verdict.NOT_READY
             assert panel.submit_for_review(packet)[0].verdict == Verdict.NOT_READY
             assert panel.submit_for_review(packet)[0].verdict == Verdict.NOT_READY
+
+    def test_same_task_blocks_only_while_thread_is_inflight_then_allows_rounds(self):
+        class BlockingProvider:
+            name = "blocking"
+            def __init__(self):
+                self.calls = 0
+                self.started = threading.Event()
+                self.release = threading.Event()
+            def review(self, packet):
+                self.calls += 1
+                self.started.set()
+                assert self.release.wait(2)
+                return ReviewResult(provider=self.name, verdict=Verdict.PASS)
+        provider = BlockingProvider()
+        panel = ReviewPanel([provider])
+        packet = ReviewPacket("same", "r", "d")
+        first = []
+        with patch.dict(os.environ, {"HERMES_REVIEW_PANEL": "1"}):
+            thread = threading.Thread(target=lambda: first.extend(panel.submit_for_review(packet)))
+            thread.start()
+            assert provider.started.wait(1)
+            second = panel.submit_for_review(packet)
+            assert second[0].verdict == Verdict.BLOCKED
+            assert provider.calls == 1
+            provider.release.set()
+            thread.join(2)
+            assert first[0].verdict == Verdict.PASS
+            assert panel.submit_for_review(packet)[0].verdict == Verdict.PASS
+            assert panel.submit_for_review(packet)[0].verdict == Verdict.PASS
+        assert provider.calls == 3
+
+    def test_provider_exception_releases_inflight_claim(self):
+        class FailingThenPassingProvider:
+            name = "failing"
+            def __init__(self):
+                self.calls = 0
+            def review(self, packet):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("provider failure")
+                return ReviewResult(provider=self.name, verdict=Verdict.PASS)
+        provider = FailingThenPassingProvider()
+        panel = ReviewPanel([provider])
+        with patch.dict(os.environ, {"HERMES_REVIEW_PANEL": "1"}):
+            assert panel.submit_for_review(ReviewPacket("retry", "r", "d"))[0].verdict == Verdict.SKIPPED
+            assert panel.submit_for_review(ReviewPacket("retry", "r", "d"))[0].verdict == Verdict.PASS
+        assert provider.calls == 2
+
     def test_task_not_active_by_default(self):
         panel = ReviewPanel()
         assert not panel.is_task_active("t1")

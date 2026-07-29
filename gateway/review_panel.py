@@ -32,27 +32,56 @@ logger = logging.getLogger(__name__)
 
 import re
 _LABELED_SECRET_RE = re.compile(
-    r'(?i)\b(token|secret|api[_-]?key|password|credential|authorization)\s*[=:]\s*[^\s,;}]+')
+    r'''(?ix)
+    (?:["']?(?:token|secret|api[_-]?key|password|credential|authorization)["']?\s*[:=]\s*)
+    (?:bearer\s+)?(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)
+    ''')
 _TOKEN_SECRET_RE = re.compile(
-    r'(?i)\bbearer\s+[^\s,;}]+|\beyJ[A-Za-z0-9._-]+|\bghp_[A-Za-z0-9]+|'
+    r'(?i)\bbearer\s+[^\s,;}\]]+|\beyJ[A-Za-z0-9._-]+|\bghp_[A-Za-z0-9]+|'
     r'\bgithub_pat_[A-Za-z0-9_]+|\bsk-[A-Za-z0-9_-]+|\bxox[baprs]-[A-Za-z0-9-]+')
+_QUERY_SECRET_RE = re.compile(
+    r'(?i)([?&](?:token|secret|api[_-]?key|password|credential|key)=)[^&#\s]+')
 
-def _mask_secrets(value: str) -> str:
+def _mask_secrets(value: Any) -> str:
     """Redact labeled values and standalone Bearer/JWT/provider token forms."""
-    redacted = _LABELED_SECRET_RE.sub(lambda match: f"{match.group(1)}=***", value or "")
-    return _TOKEN_SECRET_RE.sub("***", redacted)
+    try:
+        text = value if isinstance(value, str) else ("" if value is None else str(value))
+        redacted = _LABELED_SECRET_RE.sub("***", text)
+        redacted = _TOKEN_SECRET_RE.sub("***", redacted)
+        return _QUERY_SECRET_RE.sub(r"\1***", redacted)
+    except Exception:
+        return "***"
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     """Best-effort Windows child-tree cleanup after a reviewer timeout."""
     if process.poll() is not None:
         return
-    if os.name == 'nt':
+    should_kill = os.name != "nt"
+    if not should_kill:
         try:
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5, check=True)
+            completed = subprocess.run(
+                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                capture_output=True, text=True, shell=False, timeout=5, check=False,
+            )
+            should_kill = completed.returncode != 0
         except Exception:
+            should_kill = True
+    if should_kill:
+        try:
             process.kill()
-    else:
-        process.kill()
+        except Exception:
+            pass
+    try:
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            pass
 
 
 # ── Env gates (all default OFF) ────────────────────────────────────────────
@@ -91,16 +120,31 @@ class ReviewResult:
     elapsed_seconds: float = 0.0
     error: Optional[str] = None
 
+    def sanitized(self) -> "ReviewResult":
+        """Return a defensive copy safe for storage, logs, and callers."""
+        return ReviewResult(
+            provider=self.provider,
+            verdict=self.verdict,
+            summary=_mask_secrets(self.summary),
+            blockers=[_mask_secrets(item) for item in self.blockers],
+            risks=[_mask_secrets(item) for item in self.risks],
+            questions=[_mask_secrets(item) for item in self.questions],
+            raw_output=_mask_secrets(self.raw_output),
+            elapsed_seconds=self.elapsed_seconds,
+            error=_mask_secrets(self.error) if self.error is not None else None,
+        )
+
     def to_dict(self) -> Dict[str, Any]:
+        safe = self.sanitized()
         return {
-            "provider": self.provider,
-            "verdict": self.verdict.value,
-            "summary": self.summary,
-            "blockers": self.blockers,
-            "risks": self.risks,
-            "questions": self.questions,
-            "elapsed_seconds": self.elapsed_seconds,
-            "error": self.error,
+            "provider": safe.provider,
+            "verdict": safe.verdict.value,
+            "summary": safe.summary,
+            "blockers": safe.blockers,
+            "risks": safe.risks,
+            "questions": safe.questions,
+            "elapsed_seconds": safe.elapsed_seconds,
+            "error": safe.error,
         }
 
 
@@ -125,8 +169,9 @@ class ReviewPacket:
         parts.append(
             "\n## Review Instructions\n"
             "Review ONLY for correctness, security, regressions, and missing "
-            "requirements. Do NOT execute, modify, or approve. Return a "
-            "structured verdict: PASS, REVISE, or BLOCKED, with blockers, "
+            "requirements. Do NOT execute, modify, or approve. Your first non-empty "
+            "line MUST be exactly one of: VERDICT: PASS, VERDICT: REVISE, or "
+            "VERDICT: BLOCKED. Then provide blockers, "
             "risks, and questions as bullet lists."
         )
         return "\n".join(parts)
@@ -192,8 +237,6 @@ class GrokReviewProvider:
             return self._parse_output(output, elapsed)
         except subprocess.TimeoutExpired:
             _terminate_process_tree(process)
-            try: process.wait(timeout=5)
-            except Exception: process.kill()
             elapsed = time.monotonic() - start
             return ReviewResult(
                 provider=self.name,
@@ -322,6 +365,7 @@ class ReviewPanel:
         self._event_ids_seen: set[str] = set()
         self._event_order: List[str] = []
         self._event_limit = 4096
+        self._event_lock = threading.Lock()
         self._active_tasks: Dict[str, ReviewTask] = {}
         self._task_lock = threading.Lock()
         self._inflight_task_ids: set[str] = set()
@@ -330,13 +374,14 @@ class ReviewPanel:
         return _review_panel_enabled()
 
     def is_event_duplicate(self, event_id: str) -> bool:
-        if event_id in self._event_ids_seen:
-            return True
-        self._event_ids_seen.add(event_id)
-        self._event_order.append(event_id)
-        if len(self._event_order) > self._event_limit:
-            self._event_ids_seen.discard(self._event_order.pop(0))
-        return False
+        with self._event_lock:
+            if event_id in self._event_ids_seen:
+                return True
+            self._event_ids_seen.add(event_id)
+            self._event_order.append(event_id)
+            if len(self._event_order) > self._event_limit:
+                self._event_ids_seen.discard(self._event_order.pop(0))
+            return False
 
     def is_task_active(self, task_id: str) -> bool:
         task = self._active_tasks.get(task_id)
@@ -392,6 +437,7 @@ class ReviewPanel:
                     summary=f"Provider error: {_mask_secrets(str(exc))}",
                     error=_mask_secrets(str(exc)[:500]),
                 )
+            result = result.sanitized()
             results.append(result)
             logger.info(
                 "[ReviewPanel] %s verdict=%s for task %s round %d",
@@ -401,8 +447,8 @@ class ReviewPanel:
                 task.round,
             )
           task.finish_review()
-          task.results.extend(results)
-          return results
+          task.results.extend(result.sanitized() for result in results)
+          return [result.sanitized() for result in results]
         finally:
           with self._task_lock: self._inflight_task_ids.discard(packet.task_id)
 
