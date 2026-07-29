@@ -22,13 +22,15 @@ import logging
 import os
 import subprocess
 import time
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
-_SECRET_RE = __import__('re').compile(r'(?i)(token|secret|api[_-]?key|password|credential)\s*[=:]\s*[^\s,;]+')
+_SECRET_RE = __import__('re').compile(r'(?i)(token|secret|api[_-]?key|password|credential|authorization)\s*[=:]\s*(?:bearer\s+)?[^\s,;"}]+|bearer\s+[A-Za-z0-9._-]+|eyJ[A-Za-z0-9._-]+')
 
 def _mask_secrets(value: str) -> str:
     return _SECRET_RE.sub(lambda m: m.group(1) + '=***', value or '')
@@ -38,7 +40,7 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         return
     if os.name == 'nt':
-        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, text=True, shell=False)
+        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5)
     else:
         process.kill()
 
@@ -156,14 +158,16 @@ class GrokReviewProvider:
         prompt = packet.to_prompt()
         start = time.monotonic()
         try:
-            process = subprocess.Popen(
-                [self.cli_path, "-p", prompt],
+            with tempfile.TemporaryDirectory(prefix='hermes-review-') as cwd:
+              process = subprocess.Popen(
+                [self.cli_path, "-p", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE, cwd=cwd,
                 text=True,
                 shell=False,
                 env=self._sanitized_env(),
             )
-            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+              stdout, stderr = process.communicate(input=prompt, timeout=self.timeout_seconds)
             elapsed = time.monotonic() - start
             output = _mask_secrets((stdout or "")[: self.max_output_chars])
             if process.returncode != 0:
@@ -178,6 +182,8 @@ class GrokReviewProvider:
             return self._parse_output(output, elapsed)
         except subprocess.TimeoutExpired:
             _terminate_process_tree(process)
+            try: process.wait(timeout=5)
+            except Exception: pass
             elapsed = time.monotonic() - start
             return ReviewResult(
                 provider=self.name,
@@ -198,7 +204,7 @@ class GrokReviewProvider:
             return ReviewResult(
                 provider=self.name,
                 verdict=Verdict.DEGRADED_WITHOUT_GROK,
-                summary=f"Grok review failed: {exc}",
+                summary=f"Grok review failed: {_mask_secrets(str(exc))}",
                 elapsed_seconds=elapsed,
                 error=_mask_secrets(str(exc)[:500]),
             )
@@ -214,11 +220,8 @@ class GrokReviewProvider:
     def _parse_output(self, output: str, elapsed: float) -> ReviewResult:
         """Parse Grok's free-text output into a structured verdict."""
         text = output.strip()
-        verdict = Verdict.PASS
-        if "REVISE" in text.upper():
-            verdict = Verdict.REVISE
-        elif "BLOCKED" in text.upper():
-            verdict = Verdict.BLOCKED
+        upper = text.upper()
+        verdict = Verdict.BLOCKED if "BLOCKED" in upper else Verdict.REVISE if "REVISE" in upper else Verdict.PASS if upper.strip() == "PASS" else Verdict.BLOCKED
 
         blockers: List[str] = []
         risks: List[str] = []
@@ -308,6 +311,7 @@ class ReviewPanel:
         self.providers = providers or []
         self._event_ids_seen: set[str] = set()
         self._active_tasks: Dict[str, ReviewTask] = {}
+        self._task_lock = threading.Lock()
 
     def is_enabled(self) -> bool:
         return _review_panel_enabled()
@@ -338,9 +342,11 @@ class ReviewPanel:
                 )
             ]
 
-        task = self._active_tasks.setdefault(
-            packet.task_id, ReviewTask(task_id=packet.task_id)
-        )
+        with self._task_lock:
+            if self.is_task_active(packet.task_id):
+                return [ReviewResult(provider="panel", verdict=Verdict.BLOCKED, summary="single-flight task already active")]
+            task = self._active_tasks.setdefault(packet.task_id, ReviewTask(task_id=packet.task_id))
+            task.state = TaskState.EXECUTING
         if not task.advance_review():
             logger.warning(
                 "[ReviewPanel] Max rounds (%d) reached for task %s — awaiting human",
@@ -363,8 +369,8 @@ class ReviewPanel:
                 result = ReviewResult(
                     provider=getattr(provider, "name", "unknown"),
                     verdict=Verdict.SKIPPED,
-                    summary=f"Provider error: {exc}",
-                    error=str(exc)[:500],
+                    summary=f"Provider error: {_mask_secrets(str(exc))}",
+                    error=_mask_secrets(str(exc)[:500]),
                 )
             results.append(result)
             logger.info(

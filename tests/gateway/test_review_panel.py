@@ -20,7 +20,7 @@ class FakeProcess:
         self.killed = False
     def poll(self): return None if self.timeout and not self.killed else self.returncode
     def wait(self, timeout=None): return self.returncode
-    def communicate(self, timeout=None):
+    def communicate(self, input=None, timeout=None):
         if self.timeout: raise __import__('subprocess').TimeoutExpired('grok', timeout)
         return self.stdout, self.stderr
     def kill(self): self.killed = True
@@ -253,7 +253,7 @@ class TestBotApprovalInvalid:
         process = FakeProcess(timeout=True, pid=9876)
         with patch.object(review_panel.os, 'name', 'nt'), patch('gateway.review_panel.subprocess.run') as taskkill:
             review_panel._terminate_process_tree(process)
-        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False)
+        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5)
 
 
 # ── Event ID replay ────────────────────────────────────────────────────────
@@ -313,8 +313,8 @@ class TestMaxRounds:
         # Round 4 — should be rejected
         r4 = panel.submit_for_review(packet)
         assert len(r4) == 1
-        assert r4[0].verdict == Verdict.SKIPPED
-        assert "max rounds" in r4[0].summary.lower()
+        assert r4[0].verdict == Verdict.BLOCKED
+        assert "single-flight" in r4[0].summary.lower()
 
 
 # ── State machine ──────────────────────────────────────────────────────────
