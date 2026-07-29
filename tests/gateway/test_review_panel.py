@@ -12,6 +12,19 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+
+class FakeProcess:
+    def __init__(self, stdout="PASS", stderr="", returncode=0, timeout=False, pid=4242):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+        self.timeout, self.pid = timeout, pid
+        self.killed = False
+    def poll(self): return None if self.timeout and not self.killed else self.returncode
+    def wait(self, timeout=None): return self.returncode
+    def communicate(self, timeout=None):
+        if self.timeout: raise __import__('subprocess').TimeoutExpired('grok', timeout)
+        return self.stdout, self.stderr
+    def kill(self): self.killed = True
+
 # Ensure the gateway module is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -85,9 +98,9 @@ class TestGrokProvider:
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.run")
-    def test_grok_timeout(self, mock_run):
-        import subprocess as sp
-        mock_run.side_effect = sp.TimeoutExpired(cmd="grok", timeout=45)
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_timeout(self, mock_popen, mock_taskkill):
+        mock_popen.return_value = FakeProcess(timeout=True)
         provider = GrokReviewProvider(timeout_seconds=1)
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
@@ -95,64 +108,58 @@ class TestGrokProvider:
         assert "timed out" in result.summary.lower()
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_grok_nonzero_exit(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_nonzero_exit(self, mock_popen):
+        mock_popen.return_value = FakeProcess(returncode=1, stdout="", stderr="error")
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
         assert result.verdict == Verdict.DEGRADED_WITHOUT_GROK
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_grok_long_output_truncated(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="x" * 20000, stderr="")
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_long_output_truncated(self, mock_popen):
+        mock_popen.return_value = FakeProcess(stdout="x" * 20000)
         provider = GrokReviewProvider(max_output_chars=100)
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
         assert len(result.raw_output) <= 100
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_grok_secret_env_stripped(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="PASS", stderr="")
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_secret_env_stripped(self, mock_popen):
+        mock_popen.return_value = FakeProcess()
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         provider.review(packet)
         # Check that the env passed to subprocess had secrets removed
-        call_args = mock_run.call_args
+        call_args = mock_popen.call_args
         env = call_args.kwargs.get("env", {})
         for key in env:
             assert not any(s in key.upper() for s in ("TOKEN", "SECRET", "KEY", "PASSWORD"))
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_grok_parses_revise(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="REVISE\n- blocker: missing error handling\n- risk: SQL injection",
-            stderr="",
-        )
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_parses_revise(self, mock_popen):
+        mock_popen.return_value = FakeProcess(stdout="REVISE\n- blocker: missing error handling\n- risk: SQL injection")
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
         assert result.verdict == Verdict.REVISE
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_grok_parses_blocked(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="BLOCKED\n- blocker: security issue", stderr=""
-        )
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_parses_blocked(self, mock_popen):
+        mock_popen.return_value = FakeProcess(stdout="BLOCKED\n- blocker: security issue")
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
         assert result.verdict == Verdict.BLOCKED
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_grok_parses_pass(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="PASS", stderr="")
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_grok_parses_pass(self, mock_popen):
+        mock_popen.return_value = FakeProcess()
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
@@ -232,6 +239,22 @@ class TestBotApprovalInvalid:
         # Human approval is separate — panel has no approve() method
         assert not hasattr(panel, "approve")
 
+    def test_registered_human_allowlist_only(self):
+        panel = ReviewPanel()
+        assert panel.is_human_approval_valid("U-HUMAN", {"U-HUMAN"})
+        assert not panel.is_human_approval_valid("bot", {"U-HUMAN"})
+
+    def test_secret_masking(self):
+        from gateway.review_panel import _mask_secrets
+        assert '***' in _mask_secrets('token=abc123')
+
+    def test_windows_process_tree_termination(self):
+        from gateway import review_panel
+        process = FakeProcess(timeout=True, pid=9876)
+        with patch.object(review_panel.os, 'name', 'nt'), patch('gateway.review_panel.subprocess.run') as taskkill:
+            review_panel._terminate_process_tree(process)
+        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False)
+
 
 # ── Event ID replay ────────────────────────────────────────────────────────
 
@@ -268,9 +291,9 @@ class TestSingleFlight:
 
 class TestMaxRounds:
     @patch.dict(os.environ, {"HERMES_REVIEW_PANEL": "1", "GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
-    def test_max_3_rounds_then_stop(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="PASS", stderr="")
+    @patch("gateway.review_panel.subprocess.Popen")
+    def test_max_3_rounds_then_stop(self, mock_popen):
+        mock_popen.return_value = FakeProcess()
         panel = ReviewPanel(providers=[GrokReviewProvider()])
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
 

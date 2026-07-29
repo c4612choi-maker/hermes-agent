@@ -28,6 +28,20 @@ from typing import Any, Dict, List, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
+_SECRET_RE = __import__('re').compile(r'(?i)(token|secret|api[_-]?key|password|credential)\s*[=:]\s*[^\s,;]+')
+
+def _mask_secrets(value: str) -> str:
+    return _SECRET_RE.sub(lambda m: m.group(1) + '=***', value or '')
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Best-effort Windows child-tree cleanup after a reviewer timeout."""
+    if process.poll() is not None:
+        return
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, text=True, shell=False)
+    else:
+        process.kill()
+
 
 # ── Env gates (all default OFF) ────────────────────────────────────────────
 
@@ -142,27 +156,28 @@ class GrokReviewProvider:
         prompt = packet.to_prompt()
         start = time.monotonic()
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [self.cli_path, "-p", prompt],
-                capture_output=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.timeout_seconds,
                 shell=False,
                 env=self._sanitized_env(),
             )
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
             elapsed = time.monotonic() - start
-            output = (result.stdout or "")[: self.max_output_chars]
-            if result.returncode != 0:
+            output = _mask_secrets((stdout or "")[: self.max_output_chars])
+            if process.returncode != 0:
                 return ReviewResult(
                     provider=self.name,
                     verdict=Verdict.DEGRADED_WITHOUT_GROK,
-                    summary=f"Grok CLI returned exit code {result.returncode}",
+                    summary=f"Grok CLI returned exit code {process.returncode}",
                     raw_output=output,
                     elapsed_seconds=elapsed,
-                    error=(result.stderr or "")[:500],
+                    error=_mask_secrets((stderr or "")[:500]),
                 )
             return self._parse_output(output, elapsed)
         except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
             elapsed = time.monotonic() - start
             return ReviewResult(
                 provider=self.name,
@@ -185,7 +200,7 @@ class GrokReviewProvider:
                 verdict=Verdict.DEGRADED_WITHOUT_GROK,
                 summary=f"Grok review failed: {exc}",
                 elapsed_seconds=elapsed,
-                error=str(exc)[:500],
+                error=_mask_secrets(str(exc)[:500]),
             )
 
     def _sanitized_env(self) -> Dict[str, str]:
@@ -308,6 +323,10 @@ class ReviewPanel:
         if task and task.state in (TaskState.EXECUTING, TaskState.REVIEWING):
             return True
         return False
+
+    def is_human_approval_valid(self, user_id: str, allowlist: set[str]) -> bool:
+        """Only an explicitly registered human identity may approve a task."""
+        return bool(user_id) and user_id in allowlist
 
     def submit_for_review(self, packet: ReviewPacket) -> List[ReviewResult]:
         if not self.is_enabled():
