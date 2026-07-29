@@ -30,17 +30,27 @@ from typing import Any, Dict, List, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
-_SECRET_RE = __import__('re').compile(r'(?i)(token|secret|api[_-]?key|password|credential|authorization)\s*[=:]\s*(?:bearer\s+)?[^\s,;"}]+|bearer\s+[A-Za-z0-9._-]+|eyJ[A-Za-z0-9._-]+')
+import re
+_LABELED_SECRET_RE = re.compile(
+    r'(?i)\b(token|secret|api[_-]?key|password|credential|authorization)\s*[=:]\s*[^\s,;}]+')
+_TOKEN_SECRET_RE = re.compile(
+    r'(?i)\bbearer\s+[^\s,;}]+|\beyJ[A-Za-z0-9._-]+|\bghp_[A-Za-z0-9]+|'
+    r'\bgithub_pat_[A-Za-z0-9_]+|\bsk-[A-Za-z0-9_-]+|\bxox[baprs]-[A-Za-z0-9-]+')
 
 def _mask_secrets(value: str) -> str:
-    return _SECRET_RE.sub(lambda m: m.group(1) + '=***', value or '')
+    """Redact labeled values and standalone Bearer/JWT/provider token forms."""
+    redacted = _LABELED_SECRET_RE.sub(lambda match: f"{match.group(1)}=***", value or "")
+    return _TOKEN_SECRET_RE.sub("***", redacted)
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     """Best-effort Windows child-tree cleanup after a reviewer timeout."""
     if process.poll() is not None:
         return
     if os.name == 'nt':
-        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5)
+        try:
+            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5, check=True)
+        except Exception:
+            process.kill()
     else:
         process.kill()
 
@@ -183,7 +193,7 @@ class GrokReviewProvider:
         except subprocess.TimeoutExpired:
             _terminate_process_tree(process)
             try: process.wait(timeout=5)
-            except Exception: pass
+            except Exception: process.kill()
             elapsed = time.monotonic() - start
             return ReviewResult(
                 provider=self.name,
@@ -219,9 +229,9 @@ class GrokReviewProvider:
 
     def _parse_output(self, output: str, elapsed: float) -> ReviewResult:
         """Parse Grok's free-text output into a structured verdict."""
-        text = output.strip()
-        upper = text.upper()
-        verdict = Verdict.BLOCKED if "BLOCKED" in upper else Verdict.REVISE if "REVISE" in upper else Verdict.PASS if upper.strip() == "PASS" else Verdict.BLOCKED
+        text = _mask_secrets(output.strip())
+        matches = re.findall(r'(?im)^\s*VERDICT\s*:\s*(PASS|REVISE|BLOCKED)\s*$', text)
+        verdict = Verdict(matches[0]) if len(matches) == 1 else Verdict.BLOCKED
 
         blockers: List[str] = []
         risks: List[str] = []
@@ -254,7 +264,7 @@ class GeminiReviewProvider:
         return ReviewResult(
             provider=self.name,
             verdict=Verdict.NOT_READY,
-            summary="Gemini NOT_READY: no API key configured, gcloud auth broken",
+            summary="Gemini NOT_READY: no configured supported provider path",
             error="not_ready",
         )
 
@@ -310,8 +320,11 @@ class ReviewPanel:
     def __init__(self, providers: Optional[List[ReviewProvider]] = None):
         self.providers = providers or []
         self._event_ids_seen: set[str] = set()
+        self._event_order: List[str] = []
+        self._event_limit = 4096
         self._active_tasks: Dict[str, ReviewTask] = {}
         self._task_lock = threading.Lock()
+        self._inflight_task_ids: set[str] = set()
 
     def is_enabled(self) -> bool:
         return _review_panel_enabled()
@@ -320,6 +333,9 @@ class ReviewPanel:
         if event_id in self._event_ids_seen:
             return True
         self._event_ids_seen.add(event_id)
+        self._event_order.append(event_id)
+        if len(self._event_order) > self._event_limit:
+            self._event_ids_seen.discard(self._event_order.pop(0))
         return False
 
     def is_task_active(self, task_id: str) -> bool:
@@ -343,11 +359,14 @@ class ReviewPanel:
             ]
 
         with self._task_lock:
-            if self.is_task_active(packet.task_id):
+            if packet.task_id in self._inflight_task_ids:
                 return [ReviewResult(provider="panel", verdict=Verdict.BLOCKED, summary="single-flight task already active")]
             task = self._active_tasks.setdefault(packet.task_id, ReviewTask(task_id=packet.task_id))
             task.state = TaskState.EXECUTING
+            self._inflight_task_ids.add(packet.task_id)
         if not task.advance_review():
+            with self._task_lock:
+                self._inflight_task_ids.discard(packet.task_id)
             logger.warning(
                 "[ReviewPanel] Max rounds (%d) reached for task %s — awaiting human",
                 task.max_rounds,
@@ -362,7 +381,8 @@ class ReviewPanel:
             ]
 
         results: List[ReviewResult] = []
-        for provider in self.providers:
+        try:
+          for provider in self.providers:
             try:
                 result = provider.review(packet)
             except Exception as exc:
@@ -380,10 +400,11 @@ class ReviewPanel:
                 packet.task_id,
                 task.round,
             )
-
-        task.finish_review()
-        task.results.extend(results)
-        return results
+          task.finish_review()
+          task.results.extend(results)
+          return results
+        finally:
+          with self._task_lock: self._inflight_task_ids.discard(packet.task_id)
 
 
 # ── Factory ────────────────────────────────────────────────────────────────

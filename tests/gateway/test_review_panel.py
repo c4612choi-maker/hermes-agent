@@ -18,9 +18,14 @@ class FakeProcess:
         self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
         self.timeout, self.pid = timeout, pid
         self.killed = False
+        self.wait_calls = 0
+        self.last_input = None
     def poll(self): return None if self.timeout and not self.killed else self.returncode
-    def wait(self, timeout=None): return self.returncode
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        return self.returncode
     def communicate(self, input=None, timeout=None):
+        self.last_input = input
         if self.timeout: raise __import__('subprocess').TimeoutExpired('grok', timeout)
         return self.stdout, self.stderr
     def kill(self): self.killed = True
@@ -81,6 +86,16 @@ class TestDefaultOff:
 # ── Grok provider ──────────────────────────────────────────────────────────
 
 class TestGrokProvider:
+    @pytest.mark.parametrize('secret', ['Bearer abc.def', 'eyJabc.def', 'ghp_abcdefghijklmnopqrst', 'github_pat_abcdefghijklmnop', 'sk-abcdefghijklmnop', 'xoxb-123-abc'])
+    def test_masking_format_matrix(self, secret):
+        from gateway.review_panel import _mask_secrets
+        assert secret not in _mask_secrets('value=' + secret)
+
+    def test_verdict_requires_explicit_single_field(self):
+        p = GrokReviewProvider()
+        assert p._parse_output('VERDICT: PASS', 0).verdict == Verdict.PASS
+        assert p._parse_output('mentions BLOCKED only', 0).verdict == Verdict.BLOCKED
+        assert p._parse_output('VERDICT: PASS\nVERDICT: REVISE', 0).verdict == Verdict.BLOCKED
     def test_grok_skipped_when_disabled(self):
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
@@ -97,15 +112,18 @@ class TestGrokProvider:
         assert "not found" in result.summary.lower()
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
-    @patch("gateway.review_panel.subprocess.run")
     @patch("gateway.review_panel.subprocess.Popen")
-    def test_grok_timeout(self, mock_popen, mock_taskkill):
-        mock_popen.return_value = FakeProcess(timeout=True)
+    @patch("gateway.review_panel.subprocess.run", side_effect=__import__('subprocess').TimeoutExpired('taskkill', 5))
+    def test_grok_timeout_reaps_after_taskkill_failure(self, mock_taskkill, mock_popen):
+        process = FakeProcess(timeout=True)
+        mock_popen.return_value = process
         provider = GrokReviewProvider(timeout_seconds=1)
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
         assert result.verdict == Verdict.DEGRADED_WITHOUT_GROK
         assert "timed out" in result.summary.lower()
+        assert process.killed
+        assert process.wait_calls == 1
 
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.Popen")
@@ -141,7 +159,7 @@ class TestGrokProvider:
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.Popen")
     def test_grok_parses_revise(self, mock_popen):
-        mock_popen.return_value = FakeProcess(stdout="REVISE\n- blocker: missing error handling\n- risk: SQL injection")
+        mock_popen.return_value = FakeProcess(stdout="VERDICT: REVISE\n- blocker: missing error handling\n- risk: SQL injection")
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
@@ -159,7 +177,7 @@ class TestGrokProvider:
     @patch.dict(os.environ, {"GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.Popen")
     def test_grok_parses_pass(self, mock_popen):
-        mock_popen.return_value = FakeProcess()
+        mock_popen.return_value = FakeProcess(stdout="VERDICT: PASS")
         provider = GrokReviewProvider()
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
         result = provider.review(packet)
@@ -253,7 +271,7 @@ class TestBotApprovalInvalid:
         process = FakeProcess(timeout=True, pid=9876)
         with patch.object(review_panel.os, 'name', 'nt'), patch('gateway.review_panel.subprocess.run') as taskkill:
             review_panel._terminate_process_tree(process)
-        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5)
+        taskkill.assert_called_once_with(['taskkill', '/PID', '9876', '/T', '/F'], capture_output=True, text=True, shell=False, timeout=5, check=True)
 
 
 # ── Event ID replay ────────────────────────────────────────────────────────
@@ -276,6 +294,13 @@ class TestEventDedup:
 # ── Task single-flight ─────────────────────────────────────────────────────
 
 class TestSingleFlight:
+    def test_sequential_rounds_are_allowed(self):
+        with patch.dict(os.environ, {'HERMES_REVIEW_PANEL':'1'}):
+            panel = ReviewPanel(providers=[GeminiReviewProvider()])
+            packet = ReviewPacket(task_id='seq', requirements='r', diff_or_artifacts='d')
+            assert panel.submit_for_review(packet)[0].verdict == Verdict.NOT_READY
+            assert panel.submit_for_review(packet)[0].verdict == Verdict.NOT_READY
+            assert panel.submit_for_review(packet)[0].verdict == Verdict.NOT_READY
     def test_task_not_active_by_default(self):
         panel = ReviewPanel()
         assert not panel.is_task_active("t1")
@@ -293,7 +318,7 @@ class TestMaxRounds:
     @patch.dict(os.environ, {"HERMES_REVIEW_PANEL": "1", "GROK_REVIEWER_ENABLED": "1"})
     @patch("gateway.review_panel.subprocess.Popen")
     def test_max_3_rounds_then_stop(self, mock_popen):
-        mock_popen.return_value = FakeProcess()
+        mock_popen.return_value = FakeProcess(stdout="VERDICT: PASS")
         panel = ReviewPanel(providers=[GrokReviewProvider()])
         packet = ReviewPacket(task_id="t1", requirements="req", diff_or_artifacts="diff")
 
@@ -313,8 +338,8 @@ class TestMaxRounds:
         # Round 4 — should be rejected
         r4 = panel.submit_for_review(packet)
         assert len(r4) == 1
-        assert r4[0].verdict == Verdict.BLOCKED
-        assert "single-flight" in r4[0].summary.lower()
+        assert r4[0].verdict == Verdict.SKIPPED
+        assert "max rounds" in r4[0].summary.lower()
 
 
 # ── State machine ──────────────────────────────────────────────────────────
