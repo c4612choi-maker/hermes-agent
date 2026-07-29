@@ -68,6 +68,51 @@ def test_gateway_constructor_has_runtime_dependency_wiring():
     assert "self.review_panel = self.review_panel_runtime.panel" in source
 
 
+@pytest.mark.parametrize(
+    "master, grok, gemini",
+    [
+        (None, None, None),
+        ("0", "1", "1"),
+    ],
+)
+def test_gateway_runner_constructor_injects_default_off_runtime(
+    monkeypatch, tmp_path, caplog, master, grok, gemini,
+):
+    """Exercise the real GatewayRunner constructor with an isolated home."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("RUNTIME_TEST_TOKEN", "constructor-secret")
+    for name, value in (
+        ("HERMES_REVIEW_PANEL", master),
+        ("GROK_REVIEWER_ENABLED", grok),
+        ("GEMINI_ANALYST_ENABLED", gemini),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    import gateway.run as gateway_run
+    from gateway.config import GatewayConfig
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    before_threads = {thread.ident for thread in threading.enumerate()}
+    with patch("gateway.review_panel.subprocess.Popen") as popen, patch(
+        "gateway.review_panel.subprocess.run"
+    ) as run:
+        first = gateway_run.GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+        second = gateway_run.GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions-2"))
+
+    assert first.review_panel_runtime is second.review_panel_runtime
+    assert first.review_panel is first.review_panel_runtime.panel
+    assert first.review_panel.providers == []
+    assert len(first.adapters) == 0
+    assert len(second.adapters) == 0
+    assert {thread.ident for thread in threading.enumerate()} == before_threads
+    assert "constructor-secret" not in caplog.text
+    popen.assert_not_called()
+    run.assert_not_called()
+
+
 def test_runtime_module_has_no_import_time_side_effect_calls():
     source = (Path(__file__).parents[2] / "gateway" / "review_panel_runtime.py").read_text(encoding="utf-8")
     assert "subprocess" not in source
